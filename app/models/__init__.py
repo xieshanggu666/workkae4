@@ -40,6 +40,9 @@ class GameSession(Base):
     # 落库后刷新可恢复同一支队伍；为 None 表示当前没有在外的探索队。
     # MutableDict.as_mutable：原地修改 JSON 字段（如 exp["travel_days"]=1）也会被追踪落库
     expedition = Column(MutableDict.as_mutable(JSON), nullable=True)
+    # 最近一次探索队返程的幂等凭据（队伍快照在返程时已销毁，凭据须落在档案级）：
+    # 重复/并发落败的返程请求据此安全回放，战利品不会二次入库
+    last_expedition_return = Column(JSON, nullable=True)
     outcome = Column(JSON, nullable=True)  # 结局详情
     score = Column(Integer, nullable=False, default=0)
     created_at = Column(DateTime, server_default=func.now())

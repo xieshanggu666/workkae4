@@ -192,7 +192,7 @@ def advance(sid: int, db: Session = Depends(get_db)):
         raise HTTPException(404, "档案不存在")
     eng = BunkerEngine(db, gs)
     try:
-        crisis = eng.advance_day()
+        eng.advance_day()
         db.commit()
         db.refresh(gs)
     except BunkerEngineError as e:
@@ -203,8 +203,9 @@ def advance(sid: int, db: Session = Depends(get_db)):
         # 当前状态（含可能已挂起的待处理危机），绝不再多推进一天
         db.rollback()
         db.refresh(gs)
-        crisis = gs.pending_crisis
-    return AdvanceResult(session=get_session_detail(gs, db), crisis=crisis)
+    # crisis 字段只承载地堡危机：探索遭遇随 session.expedition.pending_encounter
+    # 下发，两条抉择通道互不串扰；正常路径与并发落败路径保持同一语义
+    return AdvanceResult(session=get_session_detail(gs, db), crisis=gs.pending_crisis)
 
 
 @router.post("/sessions/{sid}/resolve", response_model=SessionDetail)
@@ -241,6 +242,33 @@ def resolve_crisis(sid: int, body: CrisisChoice, db: Session = Depends(get_db)):
 
 
 # ---- 探索队 ----
+def _run_expedition_mutation(db, gs, action):
+    """执行探索队相关状态变更（遭遇结算/返程）。
+
+    与危机结算同一并发语义：乐观锁落败（StaleDataError）时刷新档案重试一次——
+    若对方完成的是同一次结算，引擎凭幂等记录安全回放；若是不同抉择/不同队伍
+    状态，则由引擎抛出 409/400，杜绝并发重复结算。
+    """
+    for attempt in (0, 1):
+        eng = BunkerEngine(db, gs)
+        try:
+            action(eng)
+            db.commit()
+            db.refresh(gs)
+            return
+        except BunkerEngineConflict as e:
+            db.rollback()
+            raise HTTPException(409, str(e))
+        except BunkerEngineError as e:
+            db.rollback()
+            raise HTTPException(400, str(e))
+        except StaleDataError:
+            db.rollback()
+            db.refresh(gs)
+            if attempt == 1:
+                raise HTTPException(409, "档案已被其他请求更新，请刷新后重试")
+
+
 @router.post("/sessions/{sid}/expedition/send", response_model=SessionDetail)
 def send_expedition(sid: int, body: ExpeditionSend, db: Session = Depends(get_db)):
     gs = db.get(GameSession, sid)
@@ -255,21 +283,9 @@ def resolve_expedition(sid: int, body: ExpeditionEncounterChoice, db: Session = 
     gs = db.get(GameSession, sid)
     if not gs:
         raise HTTPException(404, "档案不存在")
-    eng = BunkerEngine(db, gs)
-    try:
-        eng.resolve_expedition_encounter(body.choice_key, token=body.token)
-        db.commit()
-        db.refresh(gs)
-    except BunkerEngineConflict as e:
-        db.rollback()
-        raise HTTPException(409, str(e))
-    except BunkerEngineError as e:
-        db.rollback()
-        raise HTTPException(400, str(e))
-    except StaleDataError:
-        # 并发的重复结算：版本不匹配说明对方已先落库，幂等回放当前状态
-        db.rollback()
-        db.refresh(gs)
+    _run_expedition_mutation(
+        db, gs, lambda eng: eng.resolve_expedition_encounter(body.choice_key, token=body.token)
+    )
     return get_session_detail(gs, db)
 
 
@@ -278,21 +294,7 @@ def return_expedition(sid: int, body: ExpeditionReturn, db: Session = Depends(ge
     gs = db.get(GameSession, sid)
     if not gs:
         raise HTTPException(404, "档案不存在")
-    eng = BunkerEngine(db, gs)
-    try:
-        eng.return_expedition(token=body.token)
-        db.commit()
-        db.refresh(gs)
-    except BunkerEngineConflict as e:
-        db.rollback()
-        raise HTTPException(409, str(e))
-    except BunkerEngineError as e:
-        db.rollback()
-        raise HTTPException(400, str(e))
-    except StaleDataError:
-        # 并发的重复返程：幂等回放，战利品只结算一次
-        db.rollback()
-        db.refresh(gs)
+    _run_expedition_mutation(db, gs, lambda eng: eng.return_expedition(token=body.token))
     return get_session_detail(gs, db)
 
 

@@ -163,7 +163,9 @@ class BunkerEngine:
 
     # ---- 每日推进 ----
     def advance_day(self):
-        # 终局或存在待处理抉择（危机/探索遭遇）时都不能推进：抉择不可被"再点一天"跳过
+        # 终局后拒绝推进；存在待处理抉择（危机/探索遭遇）时也不能推进：
+        # 抉择不可被"再点一天"跳过
+        self._ensure_running()
         self._require_phase(PHASE_DAILY, "存在待处理抉择，必须先完成才能推进")
         self.session.day += 1
         self._apply_production_and_consumption()
@@ -172,11 +174,9 @@ class BunkerEngine:
         if exp and exp.get("status") == "away":
             # 探索队在外出差：地堡按在堡人口结算，探索队消耗自带物资、行军并触发遭遇
             self._apply_expedition_travel(exp)
-            # 强制返程（补给耗尽/期满/全员失联）会清除探索队状态：
-            # 此时不得再用旧 exp 触发遭遇，否则会把已结算的队伍恢复成"在外"
+            # 强制返程（补给耗尽/期满/全员失联）已在行军结算中清除探索队状态并完成
+            # 终局判定：此时不得再用旧 exp 触发遭遇，否则会把已结算的队伍恢复成"在外"
             if self.session.expedition is None:
-                if self._check_end():
-                    return None
                 return None
             if self._check_end():
                 return None
@@ -363,10 +363,16 @@ class BunkerEngine:
             raise BunkerEngineError("游戏已结束，无法执行该操作")
 
     def _require_daily_phase(self, action):
-        """经营/推进类动作只允许在每日阶段执行。"""
+        """经营/推进类动作只允许在每日阶段执行。
+
+        危机阶段与探索遭遇阶段（遭遇挂起）同样拒绝经营动作，
+        与状态机约定一致：待处理抉择存在时，地堡经营一律暂停。
+        """
         self._ensure_running()
         if self.phase == PHASE_CRISIS:
             raise BunkerEngineError(f"存在待处理危机，必须先完成抉择才能{action}")
+        if self.phase == PHASE_EXPEDITION:
+            raise BunkerEngineError(f"探索队有待处理的遭遇，必须先完成抉择才能{action}")
 
     def _pending_event(self):
         """取出当前待处理危机对应的事件定义；存档损坏时视为无法结算。"""
@@ -586,7 +592,6 @@ class BunkerEngine:
             "pending_encounter": None,
             "loot": {},
             "casualties": [],
-            "last_return": None,
         }
         self.session.expedition = dict(exp)
         names = "、".join(r.name for r in members)
@@ -661,8 +666,10 @@ class BunkerEngine:
     def resolve_expedition_encounter(self, choice_key, token=None):
         """处理探索队途中遭遇：抉择影响队员健康/士气、物资与战利品。
 
-        结算必须命中央档案里唯一的待处理遭遇：事件、选项、单体目标都与存档绑定，
-        token 用于识别过期/重复请求；结算后待处理遭遇被清除，重复提交只回放。
+        结算必须命中档案里唯一的待处理遭遇：选项与一次性 token 都和存档绑定，
+        token 用于识别过期/重复请求；结算后待处理遭遇被清除并留下幂等凭据
+        （与地堡危机的 last_resolution 同一语义），重复提交只回放上次结果，
+        效果绝不二次施加。返回 (detail, replayed)。
         """
         self._ensure_running()
         exp = self.session.expedition
@@ -670,6 +677,13 @@ class BunkerEngine:
             raise BunkerEngineError("当前没有在外的探索队")
         pending = exp.get("pending_encounter")
         if not pending:
+            # 待处理遭遇已被清除：核对是否为同一次结算的重复/并发重试，
+            # 命中幂等凭据则安全回放；同一遭遇上换了选项的重试按冲突拒绝
+            last = exp.get("last_encounter_resolution")
+            if last and token and last.get("token") == token:
+                if last.get("choice") == choice_key:
+                    return last.get("detail", ""), True
+                raise BunkerEngineConflict("该遭遇已被其他请求结算，请刷新后查看")
             raise BunkerEngineError("当前没有待处理的探索遭遇")
         if token is not None and pending.get("token") and token != pending["token"]:
             raise BunkerEngineConflict("该遭遇决策已过期，请刷新后重试")
@@ -744,21 +758,37 @@ class BunkerEngine:
         scope_zh = f"（目标：{target.name}）" if targeted else ""
         detail = "，".join(detail_parts) if detail_parts else "无显著变化"
         self._log("crisis", f"探索遭遇·{event['title']}", f"选择「{choice['label']}」{scope_zh}：{detail}", decision=choice["label"])
-        # 清除待处理遭遇，队伍继续在外行军
+        # 清除待处理遭遇并记下幂等凭据（随队伍快照落库，刷新后仍可回放），
+        # 队伍继续在外行军
         exp["pending_encounter"] = None
         exp["encounters_resolved"] = exp.get("encounters_resolved", 0) + 1
+        exp["last_encounter_resolution"] = {
+            "token": pending.get("token"),
+            "event": event["key"],
+            "choice": choice["key"],
+            "day": self.session.day,
+            "detail": detail,
+        }
         self.session.expedition = dict(exp)
+        # 遭遇可能造成队员阵亡：伤亡若使幸存者归零，立即进入终局结算，
+        # 与地堡危机结算的收尾保持一致
+        self._check_end()
         return detail, False
 
     def return_expedition(self, token=None):
         """玩家主动召回探索队：结算战利品入库、伤亡扣减、剩余物资归还。
 
-        返程必须命中央档案里唯一的在外探索队；token 用于识别过期/重复请求。
-        结算后探索队状态被清除并留下幂等凭据，重复提交只回放上次结果。
+        返程必须命中档案里唯一的在外探索队；token 用于识别过期/重复请求。
+        结算后探索队状态被清除，返程凭据记入档案（last_expedition_return），
+        重复提交只回放上次结果，战利品绝不二次入库。返回 (detail, replayed)。
         """
         self._ensure_running()
         exp = self.session.expedition
         if not exp or exp.get("status") != "away":
+            # 队伍已返程（含强制返程）：同一支队伍的重复返程按凭据幂等回放
+            last = self.session.last_expedition_return
+            if last and token and last.get("token") == token:
+                return last.get("detail", ""), True
             raise BunkerEngineError("当前没有在外的探索队")
         if exp.get("pending_encounter"):
             raise BunkerEngineError("探索队还有未处理的遭遇，无法返程")
@@ -769,13 +799,9 @@ class BunkerEngine:
     def _settle_expedition(self, exp, reason):
         """结算探索队返程：战利品入库、剩余自带物资归还、伤亡扣减。
 
-        幂等：以 token + 出发日为凭据，重复调用只回放，不二次发放战利品。
-        返回 (detail, replayed)。
+        结算后清除探索队状态，并把返程凭据写入档案级 last_expedition_return
+        （队伍快照本身随即销毁，凭据不能寄存在队伍里），重复返程据此回放。
         """
-        # 幂等回放：已有同一支队伍的返程结算记录
-        last = exp.get("last_return")
-        if last and last.get("token") == exp.get("token"):
-            return last.get("detail", ""), True
         members = self._away_residents()
         dead_members = [r for r in members if not r.alive]
         # 战利品入库
@@ -804,8 +830,12 @@ class BunkerEngine:
             detail_parts.append("全员平安归来")
         detail = "；".join(detail_parts)
         self._log("system", f"探索队返程（{reason}）", detail, decision="返程结算")
-        # 记录幂等凭据并清除探索队状态
-        exp["last_return"] = {"token": exp.get("token"), "day": self.session.day, "detail": detail}
+        # 返程凭据记入档案（队伍快照随即清除）：重复/并发落败的返程请求据此回放
+        self.session.last_expedition_return = {
+            "token": exp.get("token"),
+            "day": self.session.day,
+            "detail": detail,
+        }
         self.session.expedition = None
         self._check_end()
         return detail, False

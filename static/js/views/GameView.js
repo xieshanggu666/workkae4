@@ -38,12 +38,14 @@ window.GameView = {
     },
     async advance() {
       this.error = "";
-      if (this.s.status !== "running" || this.crisis) return;
+      if (this.s.status !== "running" || this.crisis || this.expPending) return;
       this.loading = true;
       try {
         const r = await Api.post(`/api/sessions/${this.sid}/advance`);
         this.s = r.session;
-        this.crisis = r.crisis || null;
+        // 待处理危机以存档为准：探索遭遇不走 crisis 字段，
+        // 它随 s.expedition.pending_encounter 由探索遭遇弹层处理
+        this.crisis = r.session.pending_crisis || null;
       } catch (e) {
         this.error = e.message;
         // 并发落败等 409 场景：拉取最新状态，避免覆盖掉已挂起的危机
@@ -76,21 +78,21 @@ window.GameView = {
     },
     async build(cat) {
       this.error = "";
-      if (this.crisis) return;
+      if (this.crisis || this.expPending) return;
       try {
         this.s = await Api.post(`/api/sessions/${this.sid}/build`, { category: cat });
       } catch (e) { this.error = e.message; }
     },
     async upgrade(fid) {
       this.error = "";
-      if (this.crisis) return;
+      if (this.crisis || this.expPending) return;
       try {
         this.s = await Api.post(`/api/sessions/${this.sid}/upgrade/${fid}`);
       } catch (e) { this.error = e.message; }
     },
     async assignJob(rid, job) {
       this.error = "";
-      if (this.crisis) return;
+      if (this.crisis || this.expPending) return;
       try {
         this.s = await Api.post(`/api/sessions/${this.sid}/resident/${rid}/job`, { job });
       } catch (e) { this.error = e.message; }
@@ -114,7 +116,7 @@ window.GameView = {
     async sendExpedition() {
       this.error = "";
       if (!this.expMembers.length) { this.error = "必须选择至少一名居民"; return; }
-      if (this.crisis) return;
+      if (this.crisis || this.expPending) return;
       this.loading = true;
       try {
         const supplies = {};
@@ -237,7 +239,7 @@ window.GameView = {
             <span class="fac-name">{{ f.name }}</span>
             <span class="chip">Lv.{{ f.level }}</span>
             <span class="dim">{{ {farm:'产食物',water:'产水源',power:'发电',oxygen:'产氧',med:'医疗',storage:'仓储'}[f.category] }}</span>
-            <button v-if="s.status==='running'" class="btn tiny" :disabled="!!crisis" @click="upgrade(f.id)">升级</button>
+            <button v-if="s.status==='running'" class="btn tiny" :disabled="!!crisis || expPending" @click="upgrade(f.id)">升级</button>
           </div>
         </div>
       </div>
@@ -252,7 +254,7 @@ window.GameView = {
             <div class="meter"><i>士气</i><span class="track"><span class="fill" :style="{width: r.morale+'%', background:'#ffb300'}"></span></span><b>{{ fmt(r.morale) }}</b></div>
           </div>
           <div class="p-actions" v-if="r.alive && s.status==='running'">
-            <select :value="r.job" :disabled="!!crisis || r.away" @change="assignJob(r.id, $event.target.value)">
+            <select :value="r.job" :disabled="!!crisis || expPending || r.away" @change="assignJob(r.id, $event.target.value)">
               <option value="engineer">工程师</option>
               <option value="farmer">农民</option>
               <option value="general">杂工</option>
@@ -268,7 +270,7 @@ window.GameView = {
           <div class="exp-empty">
             <p>派遣幸存者携带物资外出探索，途中可能遭遇事件，返程时统一结算战利品与伤亡。</p>
             <p class="dim">离堡人员暂停地堡生产，不消耗地堡口粮；探索队消耗自带物资。</p>
-            <button class="btn primary" :disabled="s.status!=='running' || !!crisis" @click="openExpeditionDialog">派遣探索队</button>
+            <button class="btn primary" :disabled="s.status!=='running' || !!crisis || expPending" @click="openExpeditionDialog">派遣探索队</button>
           </div>
         </div>
         <!-- 有在外队伍：状态 -->
@@ -296,7 +298,7 @@ window.GameView = {
             <span class="bc-name">{{ b.name }}</span>
             <span class="dim">等级加成 x1.6</span>
             <div class="cost" v-for="(v,k) in b.cost" :key="k">{{ {food:'食物',water:'水源',power:'电力',oxygen:'氧气'}[k] }} {{ v }}</div>
-            <button class="btn small primary" :disabled="s.status!=='running' || !!crisis" @click="build(b.category)">建造</button>
+            <button class="btn small primary" :disabled="s.status!=='running' || !!crisis || expPending" @click="build(b.category)">建造</button>
           </div>
         </div>
       </div>

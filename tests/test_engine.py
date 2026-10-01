@@ -660,6 +660,8 @@ def test_old_archive_migration_backfills_columns(db):
     gs = db.query(GameSession).first()
     assert gs.pending_crisis is None
     assert gs.last_resolution is None
+    assert gs.expedition is None
+    assert gs.last_expedition_return is None
     assert gs.row_version == 1
     # 旧档案处于每日阶段，可正常推进
     eng = BunkerEngine(db, gs, rand=FixedRand())
@@ -916,3 +918,145 @@ def test_expedition_survivor_joins_mid_journey(db):
     # 新成员加入队伍
     assert len(gs.expedition["members"]) == before_count + 1
     assert gs.survivors == 4  # 总人口增加
+
+
+# ---- 状态机统一：探索遭遇阶段与危机阶段同样锁定经营动作 ----
+
+def test_management_locked_during_expedition_encounter(db):
+    """遭遇挂起（expedition 阶段）时，建造/升级/调岗与推进一样被拒绝。"""
+    gs = make_session(db)
+    eng = BunkerEngine(db, gs, rand=ScriptedRand(encounter_key="cache"))
+    eng.send_expedition([gs.residents[0].id], {FOOD: 10, WATER: 10})
+    eng.advance_day()
+    assert eng.phase == "expedition"
+    fid = gs.facilities[0].id
+    rid = gs.residents[1].id  # 在堡居民
+    with pytest.raises(BunkerEngineError):
+        eng.build_facility("med")
+    with pytest.raises(BunkerEngineError):
+        eng.upgrade_facility(fid)
+    with pytest.raises(BunkerEngineError):
+        eng.set_job(rid, "farmer")
+    # 处理完遭遇后回到每日阶段，经营恢复
+    eng.resolve_expedition_encounter("search_carefully", token=gs.expedition["pending_encounter"]["token"])
+    assert eng.phase == "daily"
+    eng.set_job(rid, "farmer")
+    assert gs.residents[1].job == "farmer"
+
+
+# ---- 遭遇结算幂等：与地堡危机同一语义 ----
+
+def test_duplicate_encounter_resolve_replays(db):
+    """同一遭遇重复提交（同 token 同选项）：幂等回放，战利品只结算一次。"""
+    gs = make_session(db)
+    eng = BunkerEngine(db, gs, rand=ScriptedRand(encounter_key="cache"))
+    eng.send_expedition([gs.residents[0].id], {FOOD: 10, WATER: 10})
+    encounter = eng.advance_day()
+    detail1, replay1 = eng.resolve_expedition_encounter("search_carefully", token=encounter["token"])
+    assert replay1 is False
+    loot_after = dict(gs.expedition["loot"])
+    # 重复提交：回放上次结果，不再累计战利品
+    detail2, replay2 = eng.resolve_expedition_encounter("search_carefully", token=encounter["token"])
+    assert replay2 is True
+    assert detail2 == detail1
+    assert gs.expedition["loot"] == loot_after
+    assert gs.expedition["encounters_resolved"] == 1
+
+
+def test_different_choice_after_encounter_resolve_conflicts(db):
+    """同一遭遇结算后换选项重试：按冲突拒绝，不产生第二次效果。"""
+    gs = make_session(db)
+    eng = BunkerEngine(db, gs, rand=ScriptedRand(encounter_key="cache"))
+    eng.send_expedition([gs.residents[0].id], {FOOD: 10, WATER: 10})
+    encounter = eng.advance_day()
+    eng.resolve_expedition_encounter("search_carefully", token=encounter["token"])
+    loot_after = dict(gs.expedition["loot"])
+    with pytest.raises(BunkerEngineConflict):
+        eng.resolve_expedition_encounter("grab_quickly", token=encounter["token"])
+    assert gs.expedition["loot"] == loot_after
+
+
+def test_encounter_replay_survives_reload(db):
+    """遭遇幂等凭据随队伍快照落库：重开档案后重复提交仍安全回放。"""
+    from app.core.database import SessionLocal
+    from app.models import GameSession as GS
+
+    gs = make_session(db)
+    eng = BunkerEngine(db, gs, rand=ScriptedRand(encounter_key="cache"))
+    eng.send_expedition([gs.residents[0].id], {FOOD: 10, WATER: 10})
+    encounter = eng.advance_day()
+    eng.resolve_expedition_encounter("search_carefully", token=encounter["token"])
+    db.commit()
+    sid = gs.id
+
+    db2 = SessionLocal()
+    try:
+        reloaded = db2.get(GS, sid)
+        eng2 = BunkerEngine(db2, reloaded, rand=FixedRand())
+        detail, replayed = eng2.resolve_expedition_encounter(
+            "search_carefully", token=encounter["token"]
+        )
+        assert replayed is True
+        assert reloaded.expedition["loot"][FOOD] == 8  # 未二次累计
+    finally:
+        db2.close()
+
+
+# ---- 返程幂等：凭据落在档案级，队伍清除后仍可回放 ----
+
+def test_return_expedition_replays_with_token(db):
+    """重复返程（同 token）：幂等回放，战利品与归还物资只入库一次。"""
+    gs = make_session(db)
+    eng = BunkerEngine(db, gs, rand=ScriptedRand(encounter_key="cache"))
+    eng.send_expedition([gs.residents[0].id], {FOOD: 10, WATER: 10})
+    encounter = eng.advance_day()
+    eng.resolve_expedition_encounter("search_carefully", token=encounter["token"])
+    token = gs.expedition["token"]
+    detail1, replay1 = eng.return_expedition(token=token)
+    assert replay1 is False
+    food_after = gs.resources[FOOD]
+    # 队伍已清除，同 token 的重复返程安全回放而非报错
+    detail2, replay2 = eng.return_expedition(token=token)
+    assert replay2 is True
+    assert detail2 == detail1
+    assert gs.resources[FOOD] == food_after  # 没有第二次入库
+    # 无 token 或错误 token 的返程仍然被拒绝
+    with pytest.raises(BunkerEngineError):
+        eng.return_expedition()
+    with pytest.raises(BunkerEngineError):
+        eng.return_expedition(token="stale-token")
+
+
+def test_forced_return_receipt_allows_replay(db):
+    """强制返程（补给耗尽）同样留下凭据：滞留页面的重复返程请求安全回放。"""
+    gs = make_session(db)
+    eng = BunkerEngine(db, gs, rand=ScriptedRand(encounter_key="cache"))
+    eng.send_expedition([gs.residents[0].id, gs.residents[1].id], {FOOD: 2, WATER: 2})
+    token = gs.expedition["token"]
+    eng.advance_day()  # 补给耗尽 → 强制返程
+    assert gs.expedition is None
+    detail, replayed = eng.return_expedition(token=token)
+    assert replayed is True
+    assert "返程" in detail or "殉职" in detail or "归来" in detail
+
+
+# ---- 居民生死 → 终局结算：遭遇减员立即触发结局 ----
+
+def test_expedition_casualty_zero_survivors_ends_game(db):
+    """遭遇导致最后一名幸存者阵亡：游戏立即结束，不等到下一次推进。"""
+    gs = make_session(db, residents=1)
+    victim = gs.residents[0]
+    victim.health = 10
+    eng = BunkerEngine(db, gs, rand=ScriptedRand(encounter_key="trap"))
+    eng.send_expedition([victim.id], {FOOD: 10, WATER: 10})
+    encounter = eng.advance_day()
+    eng.resolve_expedition_encounter("force_free", token=encounter["token"])
+    assert victim.alive == 0
+    assert gs.survivors == 0
+    assert gs.status == "over"  # 立即终局
+    assert gs.outcome is not None
+    # 终局后一切状态变更被拒绝
+    with pytest.raises(BunkerEngineError):
+        eng.advance_day()
+    with pytest.raises(BunkerEngineError):
+        eng.return_expedition(token=gs.expedition["token"] if gs.expedition else None)
