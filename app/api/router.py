@@ -200,11 +200,16 @@ def advance(sid: int, db: Session = Depends(get_db)):
         raise HTTPException(400, str(e))
     except StaleDataError:
         # 并发/重复的“推进一天”落败：另一个请求已经推进过，这里幂等回放
-        # 当前状态（含可能已挂起的待处理危机），绝不再多推进一天
+        # 当前状态（含可能已挂起的待处理危机/探索遭遇），绝不再多推进一天
         db.rollback()
         db.refresh(gs)
         crisis = gs.pending_crisis
-    return AdvanceResult(session=get_session_detail(gs, db), crisis=crisis)
+    # 探索队在外时推进可能挂起的是遭遇而非地堡危机：把当前任一待处理抉择带回，
+    # 前端据此恢复对应弹层（落败回放与正常返回保持同一口径）
+    if crisis is None and gs.expedition and gs.expedition.get("pending_encounter"):
+        crisis = gs.expedition["pending_encounter"]
+    # pending_event 为语义准确的新字段；crisis 为兼容旧前端的同值别名
+    return AdvanceResult(session=get_session_detail(gs, db), pending_event=crisis, crisis=crisis)
 
 
 @router.post("/sessions/{sid}/resolve", response_model=SessionDetail)
@@ -267,9 +272,17 @@ def resolve_expedition(sid: int, body: ExpeditionEncounterChoice, db: Session = 
         db.rollback()
         raise HTTPException(400, str(e))
     except StaleDataError:
-        # 并发的重复结算：版本不匹配说明对方已先落库，幂等回放当前状态
+        # 并发的重复结算：版本不匹配说明对方已先落库。核对是否同一次遭遇抉择：
+        # 相同则幂等回放当前状态（效果只结算一次），否则 409 拒绝
         db.rollback()
         db.refresh(gs)
+        replay_eng = BunkerEngine(db, gs)
+        try:
+            replay_eng.reconcile_stale_expedition(
+                "encounter", token=body.token, choice_key=body.choice_key
+            )
+        except BunkerEngineConflict as e:
+            raise HTTPException(409, str(e))
     return get_session_detail(gs, db)
 
 
@@ -290,9 +303,15 @@ def return_expedition(sid: int, body: ExpeditionReturn, db: Session = Depends(ge
         db.rollback()
         raise HTTPException(400, str(e))
     except StaleDataError:
-        # 并发的重复返程：幂等回放，战利品只结算一次
+        # 并发的重复返程：版本不匹配说明对方已先落库。核对是否同一支队伍：
+        # 相同则幂等回放（战利品只结算一次，队伍已清除也能识别），否则 409
         db.rollback()
         db.refresh(gs)
+        replay_eng = BunkerEngine(db, gs)
+        try:
+            replay_eng.reconcile_stale_expedition("return", exp_token=body.token)
+        except BunkerEngineConflict as e:
+            raise HTTPException(409, str(e))
     return get_session_detail(gs, db)
 
 

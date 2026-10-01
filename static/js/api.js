@@ -8,7 +8,9 @@ const Api = {
     });
     if (!res.ok) {
       const j = await res.json().catch(() => ({}));
-      throw new Error(j.detail || "请求失败");
+      const err = new Error(j.detail || "请求失败");
+      err.status = res.status; // 409=并发落败/状态过期，调用方据此拉取最新档案
+      throw err;
     }
     return res.status === 204 || res.status === 200 ? res.json() : res.json();
   },

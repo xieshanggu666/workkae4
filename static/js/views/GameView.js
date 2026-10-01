@@ -38,15 +38,18 @@ window.GameView = {
     },
     async advance() {
       this.error = "";
-      if (this.s.status !== "running" || this.crisis) return;
+      if (this.s.status !== "running" || this.actionLocked) return;
       this.loading = true;
       try {
         const r = await Api.post(`/api/sessions/${this.sid}/advance`);
         this.s = r.session;
-        this.crisis = r.crisis || null;
+        // 两个抉择弹层统一只从服务端会话快照派生（不读返回里的 pending_event/crisis）：
+        // 该字段可能是地堡危机也可能是探索遭遇，直接复用会把遭遇渲染成危机。
+        // 地堡危机 → s.pending_crisis；探索遭遇 → s.expedition.pending_encounter（模板另判）
+        this.crisis = this.s.pending_crisis || null;
       } catch (e) {
         this.error = e.message;
-        // 并发落败等 409 场景：拉取最新状态，避免覆盖掉已挂起的危机
+        // 并发落败等 409 场景：拉取最新状态，避免覆盖掉已挂起的抉择
         await this.loadSession();
       }
       finally { this.loading = false; }
@@ -76,24 +79,28 @@ window.GameView = {
     },
     async build(cat) {
       this.error = "";
-      if (this.crisis) return;
+      if (this.actionLocked) return;
       try {
         this.s = await Api.post(`/api/sessions/${this.sid}/build`, { category: cat });
-      } catch (e) { this.error = e.message; }
+      } catch (e) { this.error = e.message; await this.loadSessionOn409(e); }
     },
     async upgrade(fid) {
       this.error = "";
-      if (this.crisis) return;
+      if (this.actionLocked) return;
       try {
         this.s = await Api.post(`/api/sessions/${this.sid}/upgrade/${fid}`);
-      } catch (e) { this.error = e.message; }
+      } catch (e) { this.error = e.message; await this.loadSessionOn409(e); }
     },
     async assignJob(rid, job) {
       this.error = "";
-      if (this.crisis) return;
+      if (this.actionLocked) return;
       try {
         this.s = await Api.post(`/api/sessions/${this.sid}/resident/${rid}/job`, { job });
-      } catch (e) { this.error = e.message; }
+      } catch (e) { this.error = e.message; await this.loadSessionOn409(e); }
+    },
+    async loadSessionOn409(e) {
+      // 409（并发落败/状态过期）统一以服务端为准，防止旧标签页继续按过期状态操作
+      if (e && e.status === 409) await this.loadSession();
     },
     setJobSel(rid, job) { this.selectedJob[rid] = job; },
     // ---- 探索队 ----
@@ -114,7 +121,7 @@ window.GameView = {
     async sendExpedition() {
       this.error = "";
       if (!this.expMembers.length) { this.error = "必须选择至少一名居民"; return; }
-      if (this.crisis) return;
+      if (this.actionLocked) return;
       this.loading = true;
       try {
         const supplies = {};
@@ -180,6 +187,10 @@ window.GameView = {
     expPending() {
       return !!(this.s && this.s.expedition && this.s.expedition.pending_encounter);
     },
+    // 抉择锁：地堡危机或探索遭遇待处理时，推进与一切经营动作统一禁用
+    actionLocked() {
+      return !!(this.crisis || this.expPending);
+    },
     pendingTitle() {
       if (this.crisis) return "请先处理当前危机";
       if (this.expPending) return "请先处理探索遭遇";
@@ -187,6 +198,12 @@ window.GameView = {
     },
     inBunkerAlive() {
       return this.s ? this.s.residents.filter(r => r.alive && !r.away) : [];
+    },
+    expMemberCount() {
+      // 只统计档案中仍在编制内的成员，兼容旧快照里夹杂已移除编号的情况
+      if (!this.s || !this.s.expedition) return 0;
+      const ids = this.s.expedition.members || [];
+      return ids.filter(id => this.s.residents.some(r => r.id === id)).length;
     },
   },
   template: `
@@ -208,7 +225,7 @@ window.GameView = {
         <div class="res-val">{{ fmt(s.resources[k]) }}</div>
         <div class="res-track"><div class="res-fill" :class="k" :style="{ width: resPct(k)+'%' }"></div></div>
       </div>
-      <button class="btn primary advance" :disabled="loading || s.status!=='running' || !!crisis || expPending" :title="pendingTitle" @click="advance">
+      <button class="btn primary advance" :disabled="loading || s.status!=='running' || actionLocked" :title="pendingTitle" @click="advance">
         {{ crisis ? '等待危机抉择' : expPending ? '等待探索遭遇抉择' : loading ? '推进中…' : '推进一天' }}
       </button>
     </section>
@@ -219,7 +236,7 @@ window.GameView = {
       <nav class="tabs">
         <button :class="{ active: tab==='overview' }" @click="tab='overview'">总览</button>
         <button :class="{ active: tab==='residents' }" @click="tab='residents'">幸存者 ({{ alive.length }})</button>
-        <button :class="{ active: tab==='expedition' }" @click="tab='expedition'">探索队<template v-if="s.expedition"> ({{ s.expedition.members.length }})</template></button>
+        <button :class="{ active: tab==='expedition' }" @click="tab='expedition'">探索队<template v-if="s.expedition"> ({{ expMemberCount }})</template></button>
         <button :class="{ active: tab==='build' }" @click="tab='build'">设施扩建</button>
         <button :class="{ active: tab==='log' }" @click="tab='log'">大事记</button>
       </nav>
@@ -237,7 +254,7 @@ window.GameView = {
             <span class="fac-name">{{ f.name }}</span>
             <span class="chip">Lv.{{ f.level }}</span>
             <span class="dim">{{ {farm:'产食物',water:'产水源',power:'发电',oxygen:'产氧',med:'医疗',storage:'仓储'}[f.category] }}</span>
-            <button v-if="s.status==='running'" class="btn tiny" :disabled="!!crisis" @click="upgrade(f.id)">升级</button>
+            <button v-if="s.status==='running'" class="btn tiny" :disabled="actionLocked" @click="upgrade(f.id)">升级</button>
           </div>
         </div>
       </div>
@@ -252,7 +269,7 @@ window.GameView = {
             <div class="meter"><i>士气</i><span class="track"><span class="fill" :style="{width: r.morale+'%', background:'#ffb300'}"></span></span><b>{{ fmt(r.morale) }}</b></div>
           </div>
           <div class="p-actions" v-if="r.alive && s.status==='running'">
-            <select :value="r.job" :disabled="!!crisis || r.away" @change="assignJob(r.id, $event.target.value)">
+            <select :value="r.job" :disabled="actionLocked || r.away" @change="assignJob(r.id, $event.target.value)">
               <option value="engineer">工程师</option>
               <option value="farmer">农民</option>
               <option value="general">杂工</option>
@@ -268,7 +285,7 @@ window.GameView = {
           <div class="exp-empty">
             <p>派遣幸存者携带物资外出探索，途中可能遭遇事件，返程时统一结算战利品与伤亡。</p>
             <p class="dim">离堡人员暂停地堡生产，不消耗地堡口粮；探索队消耗自带物资。</p>
-            <button class="btn primary" :disabled="s.status!=='running' || !!crisis" @click="openExpeditionDialog">派遣探索队</button>
+            <button class="btn primary" :disabled="s.status!=='running' || actionLocked" @click="openExpeditionDialog">派遣探索队</button>
           </div>
         </div>
         <!-- 有在外队伍：状态 -->
@@ -281,10 +298,10 @@ window.GameView = {
             <div class="exp-row" v-if="s.expedition.encounters_resolved"><span class="k">已处理遭遇</span><span class="v">{{ s.expedition.encounters_resolved }} 次</span></div>
           </div>
           <div class="exp-actions">
-            <button class="btn primary" :disabled="s.status!=='running' || expPending" @click="returnExpedition">
-              {{ expPending ? '请先处理遭遇' : '立即返程' }}
+            <button class="btn primary" :disabled="s.status!=='running' || actionLocked" @click="returnExpedition">
+              {{ crisis ? '请先处理危机' : expPending ? '请先处理遭遇' : '立即返程' }}
             </button>
-            <span class="dim" v-if="!expPending">返程时统一结算战利品与伤亡</span>
+            <span class="dim" v-if="!actionLocked">返程时统一结算战利品与伤亡</span>
           </div>
         </div>
       </div>
@@ -296,7 +313,7 @@ window.GameView = {
             <span class="bc-name">{{ b.name }}</span>
             <span class="dim">等级加成 x1.6</span>
             <div class="cost" v-for="(v,k) in b.cost" :key="k">{{ {food:'食物',water:'水源',power:'电力',oxygen:'氧气'}[k] }} {{ v }}</div>
-            <button class="btn small primary" :disabled="s.status!=='running' || !!crisis" @click="build(b.category)">建造</button>
+            <button class="btn small primary" :disabled="s.status!=='running' || actionLocked" @click="build(b.category)">建造</button>
           </div>
         </div>
       </div>

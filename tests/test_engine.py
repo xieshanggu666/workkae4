@@ -800,20 +800,31 @@ def test_return_expedition_settles_loot(db):
 
 
 def test_return_expedition_idempotent(db):
-    """重复返程：第二次为幂等回放，战利品只结算一次。"""
+    """重复返程：第二次为幂等回放，战利品只结算一次。
+
+    队伍清除后档案级 last_expedition 凭据仍可识别重复/并发落败请求，
+    统一返回上次结果而非报错（与危机结算的幂等口径一致）。
+    """
     gs = make_session(db)
     eng = BunkerEngine(db, gs, rand=ScriptedRand(encounter_key="cache"))
     eng.send_expedition([gs.residents[0].id], {FOOD: 10, WATER: 10})
     encounter = eng.advance_day()
     eng.resolve_expedition_encounter("search_carefully", token=encounter["token"])
     food_after_encounter = gs.resources[FOOD]
-    detail1, replay1 = eng.return_expedition(token=gs.expedition["token"])
+    exp_token = gs.expedition["token"]
+    detail1, replay1 = eng.return_expedition(token=exp_token)
     assert replay1 is False
     food_after_return = gs.resources[FOOD]
-    # 队伍已清除，再次返程应报错（无在外队伍）
-    with pytest.raises(BunkerEngineError):
-        eng.return_expedition()
+    # 队伍已清除，再次返程命中档案级幂等凭据：回放而不二次发放战利品
+    detail2, replay2 = eng.return_expedition(token=exp_token)
+    assert replay2 is True
+    assert detail2 == detail1
+    assert gs.expedition is None
     assert gs.resources[FOOD] == food_after_return  # 没有第二次发放
+    # 带错队伍 token 的返程则必须拒绝（不能回放别人的结算）
+    from app.services.engine import BunkerEngineConflict
+    with pytest.raises(BunkerEngineConflict):
+        eng.return_expedition(token="some-other-team-token")
 
 
 def test_forced_return_when_supplies_out(db):
@@ -916,3 +927,239 @@ def test_expedition_survivor_joins_mid_journey(db):
     # 新成员加入队伍
     assert len(gs.expedition["members"]) == before_count + 1
     assert gs.survivors == 4  # 总人口增加
+
+# ---- 统一状态流转：阶段守卫、终局收敛、前后端口径一致 ----
+
+def _force_exp_day(gs, eng, day):
+    """把在外探索队推进到指定行军天数（构造期满返程场景）。"""
+    gs.expedition["travel_days"] = day
+
+
+def test_operations_locked_during_expedition_phase(db):
+    """探索遭遇挂起（expedition 阶段）：建造/升级/调岗/返程全部被后端拒绝。
+
+    前端按钮禁用之外，后端守卫必须独立成立，防止绕过页面直接打 API。
+    """
+    gs = make_session(db)
+    eng = BunkerEngine(db, gs, rand=ScriptedRand(encounter_key="cache"))
+    eng.send_expedition([gs.residents[0].id], {FOOD: 20, WATER: 20})
+    eng.advance_day()  # 遭遇挂起
+    assert eng.phase == "expedition"
+    fid = gs.facilities[0].id
+    rid_in_bunker = gs.residents[1].id
+    with pytest.raises(BunkerEngineError):
+        eng.build_facility("med")
+    with pytest.raises(BunkerEngineError):
+        eng.upgrade_facility(fid)
+    with pytest.raises(BunkerEngineError):
+        eng.set_job(rid_in_bunker, "farmer")
+    with pytest.raises(BunkerEngineError):
+        eng.return_expedition(token=gs.expedition["token"])
+
+
+def test_away_expedition_never_pends_bunker_crisis(db):
+    """状态不变量：探索队在外的行军日只会挂起遭遇，绝不挂起地堡危机。
+
+    “危机待处理 + 探索队在外”在正常流程中不可达（派遣只允许在 daily 阶段），
+    因此返程无需单独拦截危机阶段——这里用不变量把它钉死。
+    """
+    gs = make_session(db)
+    gs.resources = {FOOD: 999, WATER: 999, POWER: 999, OXY: 999}
+    # 即便地堡危机概率拉满：在外行军日也只能触发遭遇
+    eng = BunkerEngine(db, gs, rand=TriggerRand())
+    eng.send_expedition([gs.residents[0].id], {FOOD: 30, WATER: 30})
+    result = eng.advance_day()
+    assert gs.pending_crisis is None
+    assert result is gs.expedition["pending_encounter"]
+
+
+def test_encounter_resolve_records_archive_level_idempotency(db):
+    """遭遇结算后档案上留下 last_expedition 凭据；同 token 同选项连点只回放。"""
+    gs = make_session(db)
+    eng = BunkerEngine(db, gs, rand=ScriptedRand(encounter_key="cache"))
+    eng.send_expedition([gs.residents[0].id], {FOOD: 20, WATER: 20})
+    encounter = eng.advance_day()
+    detail1, replay1 = eng.resolve_expedition_encounter(
+        "search_carefully", token=encounter["token"]
+    )
+    assert replay1 is False
+    assert gs.last_expedition["action"] == "encounter"
+    assert gs.last_expedition["token"] == encounter["token"]
+    loot_after = dict(gs.expedition["loot"])
+    # 连点同一抉择：幂等回放，战利品不二次累计
+    detail2, replay2 = eng.resolve_expedition_encounter(
+        "search_carefully", token=encounter["token"]
+    )
+    assert replay2 is True
+    assert detail2 == detail1
+    assert gs.expedition["loot"] == loot_after
+
+
+def test_encounter_replay_then_return_takes_over(db):
+    """遭遇结算后连点可回放；若另一请求已召回清队，过期遭遇请求按 409 拒绝。
+
+    档案只保留最近一次探索队动作的幂等凭据（与 last_resolution 同构）：
+    返程凭据覆盖遭遇凭据后，旧遭遇请求不应被当成新结算，也不应回放成返程结果。
+    """
+    gs = make_session(db)
+    eng = BunkerEngine(db, gs, rand=ScriptedRand(encounter_key="cache"))
+    eng.send_expedition([gs.residents[0].id], {FOOD: 20, WATER: 20})
+    encounter = eng.advance_day()
+    token = encounter["token"]
+    detail1, replay1 = eng.resolve_expedition_encounter("search_carefully", token=token)
+    assert replay1 is False
+    # 队伍尚未返程：同一遭遇连点安全回放
+    detail2, replay2 = eng.resolve_expedition_encounter("search_carefully", token=token)
+    assert replay2 is True and detail2 == detail1
+    # 另一请求把队伍召回，档案状态前进
+    team_token = gs.expedition["token"]
+    eng.return_expedition(token=team_token)
+    assert gs.expedition is None
+    # 旧遭遇请求重试：状态已变化，409 拒绝（前端据此刷新），不二次结算
+    with pytest.raises(BunkerEngineConflict):
+        eng.resolve_expedition_encounter("search_carefully", token=token)
+
+
+def test_return_wrong_team_token_is_conflict(db):
+    """返程后携带错误队伍 token 重试：409 冲突，不能回放成别人的结算。"""
+    gs = make_session(db)
+    eng = BunkerEngine(db, gs, rand=ScriptedRand(encounter_key="cache"))
+    eng.send_expedition([gs.residents[0].id], {FOOD: 10, WATER: 10})
+    encounter = eng.advance_day()
+    eng.resolve_expedition_encounter("search_carefully", token=encounter["token"])
+    real_token = gs.expedition["token"]
+    eng.return_expedition(token=real_token)
+    with pytest.raises(BunkerEngineConflict):
+        eng.return_expedition(token="wrong-team-token")
+
+
+def test_concurrent_encounter_only_one_wins(db):
+    """两个独立会话并发结算同一遭遇：乐观锁保证战利品只累计一次。"""
+    from sqlalchemy.orm.exc import StaleDataError
+
+    gs = make_session(db)
+    eng = BunkerEngine(db, gs, rand=ScriptedRand(encounter_key="cache"))
+    eng.send_expedition([gs.residents[0].id], {FOOD: 20, WATER: 20})
+    encounter = eng.advance_day()
+    db.commit()
+    sid, token = gs.id, encounter["token"]
+
+    db_a = SessionLocal()
+    db_b = SessionLocal()
+    try:
+        ga, gb = db_a.get(GameSession, sid), db_b.get(GameSession, sid)
+        ea = BunkerEngine(db_a, ga, rand=FixedRand())
+        eb = BunkerEngine(db_b, gb, rand=FixedRand())
+        ea.resolve_expedition_encounter("search_carefully", token=token)
+        db_a.commit()
+        eb.resolve_expedition_encounter("search_carefully", token=token)
+        with pytest.raises(StaleDataError):
+            db_b.commit()
+        db_b.rollback()
+
+        final = db_a.get(GameSession, sid)
+        assert final.expedition["loot"][FOOD] == 8
+        assert final.expedition["loot"][WATER] == 6
+        assert final.last_expedition["action"] == "encounter"
+    finally:
+        db_a.close()
+        db_b.close()
+
+
+def test_concurrent_return_only_one_wins(db):
+    """两个独立会话并发召回同一队伍：乐观锁保证战利品只入库一次。"""
+    from sqlalchemy.orm.exc import StaleDataError
+
+    gs = make_session(db)
+    eng = BunkerEngine(db, gs, rand=ScriptedRand(encounter_key="cache"))
+    eng.send_expedition([gs.residents[0].id], {FOOD: 10, WATER: 10})
+    encounter = eng.advance_day()
+    eng.resolve_expedition_encounter("search_carefully", token=encounter["token"])
+    db.commit()
+    sid, exp_token = gs.id, gs.expedition["token"]
+    # 结算后地堡食物基数（不含尚未入库的战利品 8）
+    base_food = db.get(GameSession, sid).resources[FOOD]
+
+    db_a = SessionLocal()
+    db_b = SessionLocal()
+    try:
+        ga, gb = db_a.get(GameSession, sid), db_b.get(GameSession, sid)
+        BunkerEngine(db_a, ga).return_expedition(token=exp_token)
+        db_a.commit()
+        BunkerEngine(db_b, gb).return_expedition(token=exp_token)
+        with pytest.raises(StaleDataError):
+            db_b.commit()
+        db_b.rollback()
+
+        final = db_a.get(GameSession, sid)
+        assert final.expedition is None
+        # 战利品 8 + 剩余口粮 9 只入库一次
+        assert final.resources[FOOD] == round(base_food + 8 + 9, 1)
+    finally:
+        db_a.close()
+        db_b.close()
+
+
+def test_forced_return_at_max_days(db):
+    """探索期满（达到最长行军天数）：当日强制返程结算，不再挂遭遇。"""
+    gs = make_session(db)
+    eng = BunkerEngine(db, gs, rand=ScriptedRand(encounter_key="cache"))
+    eng.send_expedition([gs.residents[0].id], {FOOD: 50, WATER: 50})
+    gs.expedition["travel_days"] = 6  # 下一日行军后达到 7 天上限
+    result = eng.advance_day()
+    assert result is None
+    assert gs.expedition is None
+
+
+def test_end_at_target_day_settles_away_expedition(db):
+    """胜利日探索队仍在外：先返程结算（战利品/余粮入库、成员归队）再终局。"""
+    gs = make_session(db, resources={FOOD: 999, WATER: 999, POWER: 999, OXY: 999})
+    gs.day = SURVIVAL_TARGET_DAY - 1
+    eng = BunkerEngine(db, gs, rand=ScriptedRand(random_val=0.95, encounter_key="cache"))
+    eng.send_expedition([gs.residents[0].id], {FOOD: 20, WATER: 20})
+    result = eng.advance_day()  # 0.95 > 0.85，不触发遭遇，直接到目标日
+    assert result is None
+    assert gs.status == "win"
+    assert gs.expedition is None          # 无僵尸队伍
+    assert gs.pending_crisis is None
+    # 成员平安归队，人口仍是初始 3
+    assert gs.survivors == 3
+
+
+def test_endgame_clears_expedition_snapshot(db):
+    """直接命中终局（人口归零）时：在外队伍快照一并清除，统一收敛 ended。"""
+    gs = make_session(db)
+    eng = BunkerEngine(db, gs, rand=FixedRand())
+    eng.send_expedition([gs.residents[0].id], {FOOD: 10, WATER: 10})
+    for r in gs.residents:
+        r.alive = 0
+    gs.survivors = 0
+    assert eng._check_end() is True
+    assert gs.status == "over"
+    assert gs.expedition is None
+    assert eng.phase == "ended"
+
+
+def test_crisis_all_scope_skips_away_members(db):
+    """地堡危机的全体效果只作用在堡居民；探索队成员士气不受波及。"""
+    gs = make_session(db)
+    away = gs.residents[0]
+    eng = BunkerEngine(db, gs, rand=TriggerRand())
+    eng.send_expedition([away.id], {FOOD: 20, WATER: 20})
+    # 行军日不触发地堡危机；在 daily 阶段手工挂一个内讧危机
+    crisis = arm_crisis(eng, "mutiny")
+    morale_before = away.morale
+    eng.resolve_crisis("mutiny", "suppress", token=crisis["token"])
+    assert away.morale == morale_before  # 探索队在外，不吃地堡 -15 士气
+    assert gs.residents[1].morale == 65
+
+
+def test_bunker_production_morale_uses_in_bunker_only(db):
+    """地堡产出的士气系数只计在堡人员：队员士气低不拖累地堡产出。"""
+    gs = make_session(db, resources={FOOD: 999, WATER: 999, POWER: 999, OXY: 999})
+    low = gs.residents[0]
+    eng = BunkerEngine(db, gs, rand=FixedRand())
+    eng.send_expedition([low.id], {FOOD: 30, WATER: 30})
+    low.morale = 5
+    # 在堡两人士气 80，产出系数应按 (80+80)/2 计，而非被 5 拉低
+    assert eng.avg_morale(in_bunker_only=True) == 80

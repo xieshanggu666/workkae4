@@ -80,6 +80,10 @@ class SessionDetail(BaseModel):
 
 class AdvanceResult(BaseModel):
     session: SessionDetail
+    # 本次推进挂起的待处理抉择：可能是地堡危机，也可能是探索队遭遇，
+    # 前端统一据 session.pending_crisis / session.expedition.pending_encounter 渲染
+    pending_event: Optional[Dict[str, Any]] = None
+    # 兼容旧字段名（旧前端读取 crisis）；构造方保证与 pending_event 同值
     crisis: Optional[Dict[str, Any]] = None
 
 

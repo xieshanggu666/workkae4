@@ -36,6 +36,9 @@ class GameSession(Base):
     pending_crisis = Column(JSON, nullable=True)
     # 最近一次危机结算的幂等凭据，重复/并发落败请求据此安全回放，不再二次结算
     last_resolution = Column(JSON, nullable=True)
+    # 最近一次探索队动作（遭遇抉择/返程）的幂等凭据，作用与 last_resolution 相同：
+    # 队伍在动作完成后即被清除时，凭此仍能识别并发落败/连点的重复请求并安全回放
+    last_expedition = Column(JSON, nullable=True)
     # 探索队状态快照（含一次性 token、队员、携带物资、行军天数、遭遇与战利品），
     # 落库后刷新可恢复同一支队伍；为 None 表示当前没有在外的探索队。
     # MutableDict.as_mutable：原地修改 JSON 字段（如 exp["travel_days"]=1）也会被追踪落库
